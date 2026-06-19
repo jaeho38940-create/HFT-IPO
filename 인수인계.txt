@@ -1,0 +1,359 @@
+================================================================================
+  HFT IPO 스캘핑 봇 — 인수인계 문서
+  최종 업데이트: 2026-06-19
+  작성: AI 코드 어시스턴트 (Cursor)
+================================================================================
+
+────────────────────────────────────────────────────────────────────────────────
+1. 프로젝트 개요
+────────────────────────────────────────────────────────────────────────────────
+
+목적:    신규상장(IPO) 종목 당일 LS증권 xingAPI로 HFT 스캘핑
+환경:    AWS Lightsail Windows Server / 32-bit Python 3.10+ / xingAPI COM 32bit
+메인:    hft_scalping_bot.py (~2100줄)
+설정:    .env (인증·전략 파라미터) / config/ticker.json (종목)
+실전서버: hts.ebestsec.co.kr:20001
+
+파일 구조:
+  hft_scalping_bot.py   메인 봇
+  set_ticker.py         종목 설정 유틸 (python set_ticker.py 012345)
+  .env                  인증정보·전략파라미터 (절대 깃 커밋 금지)
+  .env.example          .env 템플릿
+  config/ticker.json    매매 종목 (shcode, isu_no, start_time)
+  logs/                 CSV 매매로그
+  requirements.txt      의존성
+
+실행 순서:
+  python set_ticker.py 012345   # 전날 밤 종목 설정
+  python hft_scalping_bot.py    # 당일 매매 (Ctrl+C 종료)
+
+────────────────────────────────────────────────────────────────────────────────
+2. 전략 요약
+────────────────────────────────────────────────────────────────────────────────
+
+진입:  MA80 × (1 - ENTRY_GAP%) 지정가 1주 (BUY_PEGGED)
+       기본 ENTRY_GAP=2%, STRATEGY_ENTRY_GAP_PCT 로 조절
+
+가격추적 (PEG):
+  - MA80 변동으로 호가단위가 바뀔 때만 정정/취소+재주문
+  - 정정(CSPAT00700) 1회 허용 (AMEND_MAX_PER_ORDER=0 이면 처음부터 취소+재주문)
+  - 2회째부터 취소(CSPAT00800) → 신규매수(CSPAT00600)
+
+체결 후:
+  - TP 지정가 매도 (TAKE_PROFIT=2%)
+  - 4초 타임컷 → 익절 취소 → 시장가 매도
+
+────────────────────────────────────────────────────────────────────────────────
+3. .env 파라미터 전체 목록
+────────────────────────────────────────────────────────────────────────────────
+
+# 인증
+XING_USER_ID          HTS 아이디
+XING_USER_PW          HTS 비밀번호
+XING_CERT_PW          공인인증서 비밀번호 (실전 필수)
+XING_ACCOUNT          계좌번호 (예: 208607540-01, -자동 제거)
+XING_ACCOUNT_PW       주문 4자리 비밀번호 ← HTS 로그인 비번과 다름!
+XING_SERVER           hts.ebestsec.co.kr (실전) / demo.ebestsec.co.kr (모의)
+XING_SERVER_PORT      20001
+
+# 전략
+STRATEGY_MA_WINDOW          80  (틱 수, 신규상장 초반 80틱은 약 1분 이내 완성 가능)
+STRATEGY_ENTRY_GAP_PCT      2.0 (MA 대비 % 아래 매수, 소수입력 가능: 0.02)
+STRATEGY_TAKE_PROFIT_PCT    2.0 (체결가 대비 % 위 익절)
+STRATEGY_TIME_STOP_SEC      4   (익절 포기 타임컷 초)
+STRATEGY_ORDER_QTY          1   (고정, 변경 불가)
+
+# PEG 가격추적 튜닝
+STRATEGY_AMEND_MAX_PER_ORDER   0 (정정 허용 횟수, 0=항상 취소+재주문)
+STRATEGY_REPEG_SETTLE_MS     400 (매수접수 후 취소 금지 대기 ms, 02714 방지)
+STRATEGY_QTY_REJECT_HALT_AFTER 3 (02714 연속 N회 시 HALT)
+STRATEGY_AMEND_MIN_INTERVAL_MS 50 (연속 TR 발송 최소 간격 ms)
+STRATEGY_AMEND_SAFETY_RATIO  0.85 (초당 TR 한도 사용 비율)
+
+────────────────────────────────────────────────────────────────────────────────
+4. 아키텍처
+────────────────────────────────────────────────────────────────────────────────
+
+[메인 스레드]
+  PumpWaitingMessages 루프
+  XARealTickEvents.OnReceiveRealData  → tick_queue.put_nowait
+  XARealOrderEvents.OnReceiveRealData → fill_queue / order_event_queue.put_nowait
+
+[워커 스레드] (CoInitialize, 독립 XAQuery)
+  처리 우선순위: SC1(체결) > SC0/SC2/SC3/SC4 > TR ACK > 틱
+  MA 계산, 주문 발송, 타임컷, REPEG settle
+
+[로그 스레드]
+  log_queue → print + CSV 기록 (핫패스 완전 분리)
+
+큐:
+  tick_queue         K3 시세틱
+  fill_queue         SC1 체결
+  order_event_queue  SC0/SC2/SC3/SC4 주문이벤트
+  order_ack_queue    CSPAT TR 응답·메시지
+  log_queue          로그
+
+────────────────────────────────────────────────────────────────────────────────
+5. 지금까지 발생한 버그·오류 목록 및 해결
+────────────────────────────────────────────────────────────────────────────────
+
+[BUG-01] ResCache 블록 혼선 팝업
+  증상: CSPAT00600/00700/00800 ResFile을 1회만 LoadFromResFile → 블록 혼선 팝업
+  원인: XAQuery 객체가 TR마다 다른 InBlock 구조를 덮어씀
+  해결: ensure(res) 매번 LoadFromResFile 호출 + 프리로드 구조 추가
+  파일: ResCache 클래스 (hft_scalping_bot.py ~310라인)
+
+[BUG-02] SC1 무시 (00040 에러 처리 오분류)
+  증상: 매수 체결됐는데 IDLE로 복귀 → SC1(체결) 무시
+  원인: 메시지코드 00040("매수주문 완료")을 에러로 처리 → reset_cycle
+  해결: is_tr_success_message() 추가, 00040/00039 정상처리
+  파일: is_tr_success_message()
+
+[BUG-03] SC1 RECOVER 경로 누락
+  증상: 00040 처리 후 state=IDLE인 상태에서 SC1 도착 → 무시
+  해결: _handle_buy_fill() 에 RECOVER 경로 추가
+  파일: _handle_buy_fill() ~1224라인
+
+[BUG-04] 정정 -41 오류 (InptPwd 초기화 누락)
+  증상: CSPAT00700 정정 TR에서 에러코드 -41
+  원인: BuyAmendTemplate.fire() 에서 InptPwd(계좌비밀번호) SetFieldData 누락
+  해결: BuyAmendTemplate.prime()/fire() 에서 모든 필드 재설정
+  파일: BuyAmendTemplate 클래스
+
+[BUG-05] XING_ACCOUNT_PW 혼동
+  증상: 에러코드 01796 (계좌비밀번호 연속오류 잠금)
+  원인: .env의 XING_ACCOUNT_PW에 HTS 로그인 비밀번호 입력 (주문 4자리 아님)
+  해결: is_account_password_lock() 추가 → HALT 처리
+  파일: is_account_password_lock()
+  주의: XING_ACCOUNT_PW = HTS 주문 비밀번호 4자리 (로그인 비밀번호 아님!)
+
+[BUG-06] 02714 정정거부 — "체결됨"으로 오판단
+  증상: 미체결 상태인데 02714 → 봇이 체결된 것으로 착각
+  원인: 02714를 "체결 추정"으로 처리하는 잘못된 로직
+  해결: 단순 거부로 처리, 취소+재주문 전환 or 큐 유지
+  파일: is_amend_reject_qty_or_funds(), _on_qty_reject()
+
+[BUG-07] SC2 미수신 (ordno 필드 불일치)
+  증상: 정정접수 후 SC2(정정확인)가 한 번도 처리 안 됨
+  원인: SC2 OutBlock의 ordno는 새 번호, orgordno가 원주문번호
+         → 매칭 조건에서 ordno만 확인해 전부 버렸음
+  해결: _order_event_matches_buy() 에 orgordno 매칭 추가
+  파일: OrderEventMsg.org_ord_no 필드, OnReceiveRealData 파싱
+
+[BUG-08] SC2 대기 500ms 게이트 — 레이턴시 낭비
+  증상: 정정 1회 후 SC2 올 때까지 500ms 추가 정정 금지
+  원인: SC2 대기를 과도하게 설계 (당시 02714 원인 탐색 중)
+  해결: SC2 게이트 완전 제거, ACK 기준 즉시 확정
+  파일: amend_await_sc2, amend_sc2_deadline 관련 코드 제거
+
+[BUG-09] 02714 취소거부 폭주 (재시도 무한루프)
+  증상: 취소 02714 거부 후 0.2초마다 재시도 → 로그 폭주
+  원인: _handle_buy_cancel_ack() 에서 buy_cancel_in_flight만 해제
+        → 틱마다 _send_buy_cancel_replace 재호출
+  해결: _on_qty_reject() → 즉시 HALT + 재시도 금지
+  파일: _on_qty_reject()
+
+[BUG-10] REPEG 매수접수 직후 너무 빠른 취소 → 02714
+  증상: 신규 매수접수 ~240ms 후 취소 → LS 서버가 02714 거부
+  원인: LS 서버에서 새 주문이 서버 내부 정착 전 취소 TR 도달
+  해결: REPEG_SETTLE_MS (기본 400ms) — 매수접수 후 취소 금지 대기
+  파일: _mark_buy_settle(), _can_sync_pegged_price(), _poll_repeg_settle()
+
+[BUG-11] 정정 2회 불가 (LS API 특성)
+  증상: 같은 주문에 정정 1회는 되지만 2회째부터 항상 02714
+  원인: LS xingAPI에서 동일 주문 2회 정정 제한 (확정)
+  해결: AMEND_MAX_PER_ORDER=1 로 1회 정정 후 취소+재주문 전환
+        AMEND_MAX_PER_ORDER=0 이면 처음부터 취소+재주문 (현재 기본값)
+  파일: CONFIG["AMEND_MAX_PER_ORDER"], _sync_pegged_buy()
+
+[BUG-12] _flush_queued_amend 큐 소실
+  증상: rate limit 등으로 막혀도 queued_buy_limit이 0으로 날아감
+  해결: flush 후 실제로 전송 안 됐으면 큐 복구
+  파일: _flush_queued_amend()
+
+[WARN-01] 봇 시작 전 미체결 잔존
+  문제: 이전 세션 미체결 주문이 남아 있으면 02714 연발
+  대처: 봇 시작 전 HTS에서 해당 종목 미체결 전부 취소 필수
+        봇 자동 정리 기능 미구현 (추후 구현 필요)
+
+[WARN-02] 신규상장 초반 300-500틱/초 → LS 서버 응답 지연
+  문제: 초반 틱 폭발 시 TR ACK 지연 → REPEG settle 시간 내에 ACK 미도착 가능
+        → ACK 전 큐에 쌓인 취소가 settle 해제 후 한꺼번에 나감
+  대처: REPEG_SETTLE_MS를 400이상 유지 (속도 손해 감수)
+        서버 부하 피크 구간(09:00~09:05)에는 PEG 추적 느릴 수 있음
+
+────────────────────────────────────────────────────────────────────────────────
+6. 50ms 레이턴시 달성 가능성 분석
+────────────────────────────────────────────────────────────────────────────────
+
+【결론 먼저】
+  - MA 계산 → 주문발송: 1ms 미만 (내부 처리)
+  - 주문발송 → ACK: 30~80ms (LS 실전 서버, AWS 서울 EC2 기준)
+  - 정정 1회: ~30~60ms (50ms 경계에 걸침)
+  - 취소+재주문: ~80~150ms (50ms 불가)
+  - 연속 PEG 추적(취소+재주문): 50ms 구조적으로 불가능
+
+【병목 구간 분류】
+  ① 봇 내부 (틱 큐→MA→주문발송): <1ms            ✅ 문제없음
+  ② TR 왕복 (발송~ACK): 30~80ms                   △ 정정만 50ms 가능
+  ③ 취소+재주문 (TR×2 직렬): 80~150ms             ❌ 50ms 불가
+  ④ REPEG_SETTLE 400ms 대기: 설계상 400ms         ❌ 50ms 불가 (의도적)
+  ⑤ IPO 초반 LS 서버 부하 지연: +50~200ms 추가    ❌ 가변적
+
+【LS xingAPI 리테일 구조적 한계】
+  - 거래소 코로케이션 아님 → TR 왕복 최소 30ms
+  - COM 싱글 XAQuery 객체 → 동시 TR 1개 처리
+  - 정정 2회째부터 02714 → 취소+재주문 강제
+  - 취소 후 재주문까지 2 TR 왕복 최소 60ms+
+
+【50ms 이내 가능한 것】
+  - 첫 정정(CSPAT00700) 1회: 빠른 날 35~50ms 가능 (빠른 편)
+  - SC1 수신→익절 지정가 발송: 내부처리 <1ms + TR 왕복 ~40ms
+  - MA 계산 자체: <0.1ms
+
+【50ms 이내 불가능한 것】
+  - 정정 2회 이상 연속 PEG 추적
+  - 취소+재주문 방식의 PEG 추적
+  - IPO 초반(09:00~09:05) 서버 부하 시 모든 TR
+
+【비교: 한투 REST API + 우분투】
+  - TR 왕복 자체는 비슷 (30~80ms, 서버 위치가 핵심)
+  - 우분투는 COM GIL 없어 다소 유리, 그러나 10배 빠르진 않음
+  - 정정 횟수 제한: 증권사마다 다름 (한투는 여러 번 가능할 수 있음)
+  - 차이가 난다면 정정 여러 번 허용 여부 (LS 2회 제한이 핵심 병목)
+
+────────────────────────────────────────────────────────────────────────────────
+7. 현재 코드 구조 문제점 및 잠재 버그
+────────────────────────────────────────────────────────────────────────────────
+
+[ISSUE-01] 워커 루프 틱 처리 1개씩
+  현재: tick_queue.get(timeout=0.001) → 1개 처리 후 다시 상단으로
+  문제: 300~500틱/초 버스트 시 tick_queue 누적 → MA가 오래된 값 기준
+  개선안: _drain_queue(tick_queue, engine.process_tick) 으로 한 번에 비우기
+  주의: 변경 시 한 루프에서 MA 300회 계산 → CPU 부하 확인 필요
+
+[ISSUE-02] REPEG_SETTLE 중 queued_buy_limit 갱신 누락
+  현재: settle 중 틱이 와도 _can_sync_pegged_price() False → queued_buy_limit 갱신 ok
+        그런데 settle 해제 직후 _poll_repeg_settle이 queued 값 사용 → 정상
+  상태: 현재 설계상 ok, 단 settle 길면 MA 많이 이탈 후 오래된 가격으로 재주문 위험
+
+[ISSUE-03] 취소+재주문 도중 SC1(체결) 레이스
+  시나리오: 취소 TR 발송 후 ~ SC3(취소확인) 전에 SC1(체결) 도착
+  현재 처리: buy_cancel_in_flight=True이면 _handle_buy_fill에서 RECOVER 경로
+  위험: in_replace=True 상태에서 체결 → _repost_pegged_buy 실행 안 함 → 정상
+        CANCEL+FILL 레이스 시 매도 주문 발송 잘 되는지 확인 필요 (로그 검토 권고)
+
+[ISSUE-04] 매수 ACK에서 buy_settle_until 덮어쓰기
+  현재: REPEG 매수 ACK 시 _mark_buy_settle() 호출
+        최초 매수(PEG)도 ACK 시 동일하게 settle 적용됨
+  영향: 최초 매수 후에도 400ms 동안 정정/취소 금지
+        → 빠른 가격 변동 시 첫 정정 타이밍 늦어짐
+  개선안: REPEG 재배치 시에만 settle 적용, 최초 PEG는 settle 없애기
+
+[ISSUE-05] _flush_queued_amend 루프 위험
+  현재: flush 후 조건 불만족 시 queued_buy_limit = target 복구
+        → 다음 틱에서 다시 flush → 정상이면 ok
+  위험: _can_sync_pegged_price() 계속 False일 때 매 틱마다 flush 시도
+        (실제 TR 미발송이라 문제는 없으나 로그 없어서 추적 어려움)
+
+[ISSUE-06] BUY_ORDERED 상태 하위호환 처리 미흡
+  현재: BotState.BUY_ORDERED alias만 정의, 실제 전환 로직 없음
+  영향: 이전 세션 코드와 호환만 유지, 실전 사용 안 함
+  권고: 다음 정리 시 제거
+
+[ISSUE-07] set_ticker.py isu_no 자동 설정 없음
+  현재: isu_no를 --isu 옵션으로 수동 입력 or 기본값 A+shcode
+  문제: 신규상장 종목 일부는 isu_no 형식이 다를 수 있음 (예: Q+shcode)
+  대처: ticker.json 확인 후 봇 시작 전 수동 검증 권고
+
+[ISSUE-08] 멀티 XAQuery 없음
+  현재: 워커 스레드 XAQuery 1개로 모든 TR 처리 (직렬)
+  제약: 취소+재주문 시 00800 → 00600 완전 직렬
+  이론상 개선: XAQuery 2개 (매수전용/취소전용) → 병렬화
+  현실: COM STA 스레드 모델 제약으로 구현 복잡도 매우 높음
+
+────────────────────────────────────────────────────────────────────────────────
+8. 즉시 적용 권장 수정
+────────────────────────────────────────────────────────────────────────────────
+
+① 워커 루프 틱 처리 개선 (IPO 초반 틱 폭발 대응)
+  현재: tick_queue.get(timeout=0.001) → 1개만 처리
+  수정: 버스트 구간에는 최신 틱 1개만 처리 (TICK_QUEUE 드레인 후 마지막만 사용)
+  → MA는 전부 갱신하되, 주문 판단은 마지막 가격 1개로
+
+② 최초 PEG ACK에서 settle 제거
+  현재: 모든 매수 ACK → settle 400ms
+  수정: buy_amend_count==0 and not buy_cancel_in_flight 이면 settle 짧게 (100ms)
+
+③ .env 기본값 가이드라인 (IPO 당일)
+  STRATEGY_REPEG_SETTLE_MS=500     # IPO 초반 서버 느림 감안
+  STRATEGY_QTY_REJECT_HALT_AFTER=5 # 02714 좀 더 허용
+  STRATEGY_AMEND_MAX_PER_ORDER=0   # 처음부터 취소+재주문
+  STRATEGY_AMEND_MIN_INTERVAL_MS=100 # IPO 서버 부하 감안 여유
+
+────────────────────────────────────────────────────────────────────────────────
+9. 운영 체크리스트
+────────────────────────────────────────────────────────────────────────────────
+
+전날 밤:
+  □ python set_ticker.py [종목코드]
+  □ ticker.json 확인 (shcode, isu_no, start_time)
+  □ .env 전략 파라미터 확인
+  □ HTS 계좌 미체결 없음 확인
+
+당일 아침 (08:40 이전):
+  □ HTS에서 해당 종목 미체결 전부 없음 확인 ← 중요!
+  □ HTS 잔고/보유수량 0 확인
+  □ python hft_scalping_bot.py 실행
+  □ WARMUP → MAREADY 로그 확인
+  □ SIGNAL → ORDER → ACK 정상 확인
+
+이상 징후:
+  □ HALT 로그 → 즉시 HTS 미체결 확인
+  □ 02714 반복 → HTS 미체결 정리 후 재시작
+  □ REPEG 폭주 → REPEG_SETTLE_MS 값 확인
+  □ 정정거부 연속 → AMEND_MAX_PER_ORDER=0 확인
+
+────────────────────────────────────────────────────────────────────────────────
+10. 향후 개선 과제 (우선순위 순)
+────────────────────────────────────────────────────────────────────────────────
+
+HIGH:
+  1. 봇 시작 시 t0425(미체결조회) 자동 취소 — 중복주문 방지
+  2. ISSUE-01: 틱 드레인 최신 1개만 처리 (IPO 초반 300~500틱/초 대응)
+  3. ISSUE-04: 최초 PEG settle 단축
+
+MEDIUM:
+  4. SC1 레이스 로그 강화 — 취소+재주문 도중 체결 케이스 추적
+  5. BENCH 로그: TR 발송~ACK 시간 측정 (perf_counter 활용)
+  6. 실제 02714 원인 구분: 미체결 잔존 vs 서버 정착 전 vs 2회 정정 제한
+
+LOW:
+  7. BUY_ORDERED 상태 코드 정리
+  8. XAQuery 2개 병렬화 검토 (난이도 높음)
+  9. 한투 API 이전 시 정정 횟수 제한 비교 테스트
+
+================================================================================
+  로그 액션 코드 설명
+================================================================================
+  TICK    첫 체결틱 수신
+  WARMUP  MA 준비중
+  MAREADY MA80 완성
+  SIGNAL  PEG 매수 신호
+  STATE   상태 변경
+  ORDER   주문 발송
+  ACK     주문접수 (거래소)
+  FILL    매수 체결
+  TP      익절 매도 발송
+  AMEND   정정 요청/접수/거부
+  REPEG   취소+재주문 (가격 변경)
+  CANCEL  취소 접수/처리
+  TIMEOUT 타임컷 발동
+  RECOVER SC1 지연 체결 복구
+  HALT    치명 오류, 주문 중단
+  WARN    경고 (비치명)
+  ERROR   오류
+  WORKER  워커 스레드 시작/종료
+  STOP    봇 종료
+
+================================================================================
